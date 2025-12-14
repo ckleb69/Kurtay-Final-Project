@@ -1,0 +1,109 @@
+import os, numpy as np, pandas as pd
+from math import log, pi
+from scipy.special import gamma
+from scipy.optimize import minimize
+from scipy.stats import t as student_t_dist
+from scipy.integrate import quad
+import lmoments3 as lm
+from numpy.random import default_rng
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore")
+
+# PATHS
+BASE = r"C:\Kurtay Finance Project\Data"
+RESID_DIR = os.path.join(BASE, "Student_Residuals")
+OUT_FILE  = os.path.join(BASE, "Bootstrap_Robustness_Lmoment.csv")
+
+
+def ll_normal(z):
+    return -0.5 * np.sum(z**2 + log(2*pi))
+
+def ll_student_t(z, nu):
+    c = gamma((nu + 1) / 2) / (np.sqrt(nu * pi) * gamma(nu / 2))
+    return np.sum(np.log(c) - ((nu + 1) / 2) * np.log(1 + z**2 / nu))
+
+def ll_pearson7(z, m, scale):
+    # Log-Likelihood used ONLY for AIC score, not for estimation
+    c = gamma(m) / (scale * np.sqrt(pi) * gamma(m - 0.5))
+    return np.sum(np.log(c) - m * np.log(1 + (z / scale)**2))
+
+def mle_student_t(z):
+    # Keep Student-t as MLE benchmark
+    def nll(nu):
+        if nu <= 2: return 1e20
+        return -ll_student_t(z, nu)
+    res = minimize(lambda x: nll(x[0]), x0=[8.0], bounds=[(2.01, 200)], method="L-BFGS-B")
+    return res.x[0]
+ 
+# SETTINGS
+B = 500
+BLOCK = 30
+rng = default_rng(1234)
+
+# --- REUSE HELPER FUNCTIONS FROM SCRIPT 1 HERE ---
+# (Paste: get_theoretical_lmoms, ll_normal, ll_student_t, ll_pearson7)
+# For brevity, I will assume you copy the 'get_theoretical_lmoms' and 'll_*' functions 
+# from the first script above into here.
+
+def fit_pearson7_lmom_fast(sample_l2, sample_tau4):
+    # Optimized for speed inside loop
+    def obj(p):
+        if p[0] <= 1.01 or p[1] <= 1e-6: return 1e9
+        tl2, tt4 = get_theoretical_lmoms(p[0], p[1])
+        return (tl2 - sample_l2)**2 + (tt4 - sample_tau4)**2
+    res = minimize(obj, [4.0, 1.0], bounds=[(1.02, 50), (0.01, 10)], method='L-BFGS-B')
+    return res.x
+
+def mle_student_t(z):
+    def nll(nu): return -(ll_student_t(z, nu) if nu>2 else -1e10)
+    res = minimize(lambda x: nll(x[0]), [8.0], bounds=[(2.01, 200)], method="L-BFGS-B")
+    return res.x[0]
+
+# BOOTSTRAP LOOP
+files = [f for f in os.listdir(RESID_DIR) if f.endswith("_resid.csv")]
+records = []
+
+print(f"\n🚀 Bootstrap (L-Moments) B={B}...\n")
+
+for f in tqdm(files):
+    tkr = f.replace("_resid.csv","")
+    z0 = pd.read_csv(os.path.join(RESID_DIR,f))["std_resid"].dropna().to_numpy()
+    
+    wins = {"Normal":0, "StudentT":0, "PearsonVII":0}
+    
+    for _ in range(B):
+        # Block Bootstrap
+        idxs = []
+        while len(idxs) < len(z0):
+            start = rng.integers(0, len(z0) - BLOCK)
+            idxs.extend(range(start, start+BLOCK))
+        z = z0[idxs[:len(z0)]]
+
+        # 1. Normal
+        aicN = 2*0 - 2*ll_normal(z)
+
+        # 2. Student-t (MLE)
+        aicT = 2*1 - 2*ll_student_t(z, mle_student_t(z))
+
+        # 3. Pearson VII (L-Moments)
+        try:
+            # Fast L-moment calc
+            lm_vals = lm.lmom_ratios(z.tolist(), nmom=4)
+            m_est, s_est = fit_pearson7_lmom_fast(lm_vals[1], lm_vals[3])
+            aicP = 2*2 - 2*ll_pearson7(z, m_est, s_est)
+        except:
+            aicP = 999999 # Fail safe
+
+        # Winner
+        best = min({"Normal":aicN, "StudentT":aicT, "PearsonVII":aicP}, key=lambda k: {"Normal":aicN, "StudentT":aicT, "PearsonVII":aicP}[k])
+        wins[best] += 1
+
+    records.append({
+        "ticker": tkr,
+        "Pearson_Win": wins["PearsonVII"]/B,
+        "Student_Win": wins["StudentT"]/B,
+        "Normal_Win": wins["Normal"]/B
+    })
+
+pd.DataFrame(records).to_csv(OUT_FILE, index=False)

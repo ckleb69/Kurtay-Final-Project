@@ -1,0 +1,229 @@
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import t as student_t_dist
+from scipy.stats import chi2
+from scipy.special import gamma
+from scipy.optimize import minimize
+from scipy.integrate import quad
+from arch import arch_model
+import lmoments3 as lm
+import warnings
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+
+# ===============================================================
+# CONFIGURATION & PATHS
+# ===============================================================
+BASE_DIR = r"C:\Kurtay Finance Project\Data"
+IN_PATH  = os.path.join(BASE_DIR, "CLEANWRDS.csv")  # Must contain 'ticker', 'log_ret'
+OUT_PATH = os.path.join(BASE_DIR, "VaR_Backtest_Results.csv")
+
+# Risk Levels to Test
+ALPHAS = [0.01, 0.05]  # 1% and 5% VaR
+
+# ===============================================================
+# HELPER: KUPIEC POF TEST
+# ===============================================================
+def kupiec_pof_test(breaches, total_obs, alpha):
+    """
+    Calculates the Kupiec Proportion of Failures (POF) test statistic.
+    H0: Observed failure rate == alpha
+    Returns: p-value (if p < 0.05, we reject the model)
+    """
+    p_obs = breaches / total_obs
+    
+    # Handle edge cases (0 breaches or 100% breaches) to avoid log(0)
+    if breaches == 0:
+        return 0.0, 0.0 # Technically p-val is small if N is large, but LR is problematic
+    if breaches == total_obs:
+        return 0.0, 0.0
+
+    # Likelihood Ratio (LR)
+    # Numerator: Likelihood under H0 (p = alpha)
+    # Denominator: Likelihood under H1 (p = observed)
+    
+    # Log-Likelihoods
+    ll_null = (total_obs - breaches) * np.log(1 - alpha) + breaches * np.log(alpha)
+    ll_alt  = (total_obs - breaches) * np.log(1 - p_obs) + breaches * np.log(p_obs)
+    
+    lr_stat = -2 * (ll_null - ll_alt)
+    p_value = 1 - chi2.cdf(lr_stat, df=1)
+    
+    return lr_stat, p_value
+
+# ===============================================================
+# HELPER: PEARSON VII L-MOMENT FITTING
+# ===============================================================
+def get_theoretical_lmoms(m, scale):
+    """Calculates Theoretical L2 and Tau4 for Pearson VII via Student-t equivalence."""
+    if m <= 1.01 or scale <= 0: return np.inf, np.inf
+    nu = 2 * m - 1
+    factor = scale / np.sqrt(nu)
+    
+    # L2 Integration
+    # Integral of Q(F) * (2F - 1)
+    l2_raw, _ = quad(lambda f: student_t_dist.ppf(f, df=nu) * (2*f - 1), 0, 1)
+    theo_l2 = l2_raw * factor
+    
+    # L4 Integration
+    # Integral of Q(F) * (20F^3 - 30F^2 + 12F - 1)
+    l4_raw, _ = quad(lambda f: student_t_dist.ppf(f, df=nu) * (20*f**3 - 30*f**2 + 12*f - 1), 0, 1)
+    theo_l4 = l4_raw * factor
+    
+    # Tau4
+    if theo_l2 == 0: return np.inf, np.inf
+    theo_tau4 = theo_l4 / theo_l2
+    
+    return theo_l2, theo_tau4
+
+def fit_pearson7_lmom(z):
+    """Fits Pearson VII params (m, scale) to residuals using L-moments."""
+    try:
+        # 1. Sample L-Moments
+        lm_vals = lm.lmom_ratios(z.tolist(), nmom=4)
+        samp_l2, samp_t4 = lm_vals[1], lm_vals[3]
+        
+        # 2. Optimize
+        def obj(p):
+            if p[0] <= 1.01 or p[1] <= 1e-6: return 1e9
+            tl2, tt4 = get_theoretical_lmoms(p[0], p[1])
+            return (tl2 - samp_l2)**2 + (tt4 - samp_t4)**2
+
+        res = minimize(obj, [4.0, 1.0], bounds=[(1.02, 50.0), (0.01, 10.0)], method="L-BFGS-B")
+        return res.x[0], res.x[1]
+    except:
+        return np.nan, np.nan
+
+# ===============================================================
+# HELPER: STUDENT-T MLE FITTING
+# ===============================================================
+def ll_student_t(z, nu):
+    if nu <= 2: return -1e10
+    c = gamma((nu + 1) / 2) / (np.sqrt(nu * np.pi) * gamma(nu / 2))
+    return np.sum(np.log(c) - ((nu + 1) / 2) * np.log(1 + z**2 / nu))
+
+def fit_student_t_mle(z):
+    def nll(nu): return -ll_student_t(z, nu[0])
+    res = minimize(nll, [8.0], bounds=[(2.01, 200.0)], method="L-BFGS-B")
+    return res.x[0]
+
+# ===============================================================
+# MAIN EXECUTION
+# ===============================================================
+def main():
+    print(f"🚀 Starting VaR Backtest (L-Moments vs MLE)...")
+    
+    # 1. Load Data
+    df = pd.read_csv(IN_PATH)
+    tickers = df["ticker"].unique()
+    results = []
+
+    print(f"data loaded: {len(tickers)} tickers found.")
+    print("-" * 80)
+    print(f"{'Ticker':<8} | {'Model':<10} | {'VaR 1% Rate':<12} | {'Kupiec p':<10} | {'VaR 5% Rate':<12} | {'Kupiec p':<10}")
+    print("-" * 80)
+
+    for t in tickers:
+        subset = df[df["ticker"] == t].copy()
+        returns = subset["log_ret"].dropna() * 100.0 # Scale to % for stability
+        
+        if len(returns) < 500: continue # Need enough data for backtest
+
+        # 2. Fit EGARCH(1,3)-Student-t Benchmark Filter
+        # We re-fit here to ensure we have the exact conditional volatility (sigma_t)
+        try:
+            am = arch_model(returns, vol="EGARCH", p=1, q=3, dist="t", rescale=False)
+            res = am.fit(disp="off")
+            
+            mu = res.params['mu']
+            sigma_t = res.conditional_volatility
+            z_t = res.std_resid
+            n_obs = len(z_t)
+            
+            # 3. Estimate Distribution Parameters
+            
+            # A) Student-t (MLE)
+            nu_mle = fit_student_t_mle(z_t)
+            
+            # B) Pearson VII (L-Moments)
+            m_lmom, s_lmom = fit_pearson7_lmom(z_t)
+            
+            # 4. Calculate Quantiles & VaR
+            
+            stats_row = {"ticker": t, "n_obs": n_obs}
+            
+            for alpha in ALPHAS:
+                # --- Student-t MLE VaR ---
+                # Q = t.ppf(alpha, df)
+                q_stud = student_t_dist.ppf(alpha, df=nu_mle)
+                var_stud = mu + sigma_t * q_stud
+                
+                # Check Breaches
+                breaches_stud = np.sum(returns < var_stud)
+                rate_stud = breaches_stud / n_obs
+                _, p_stud = kupiec_pof_test(breaches_stud, n_obs, alpha)
+                
+                # --- Pearson VII L-Mom VaR ---
+                # Q = t.ppf(alpha, df=2m-1) * (scale / sqrt(2m-1))
+                if np.isnan(m_lmom):
+                    rate_pearson = np.nan
+                    p_pearson = np.nan
+                else:
+                    df_equiv = 2 * m_lmom - 1
+                    scale_factor = s_lmom / np.sqrt(df_equiv)
+                    
+                    q_raw = student_t_dist.ppf(alpha, df=df_equiv)
+                    q_pearson = q_raw * scale_factor
+                    
+                    var_pearson = mu + sigma_t * q_pearson
+                    
+                    breaches_pearson = np.sum(returns < var_pearson)
+                    rate_pearson = breaches_pearson / n_obs
+                    _, p_pearson = kupiec_pof_test(breaches_pearson, n_obs, alpha)
+                
+                # Store Stats
+                label = int(alpha*100)
+                stats_row[f"Stud_Rate_{label}"] = rate_stud
+                stats_row[f"Stud_Pval_{label}"] = p_stud
+                stats_row[f"Pear_Rate_{label}"] = rate_pearson
+                stats_row[f"Pear_Pval_{label}"] = p_pearson
+
+            results.append(stats_row)
+            
+            # Print Quick Summary for 1%
+            print(f"{t:<8} | {'Student':<10} | {stats_row['Stud_Rate_1']:.4f}       | {stats_row['Stud_Pval_1']:.4f}     | {stats_row['Stud_Rate_5']:.4f}       | {stats_row['Stud_Pval_5']:.4f}")
+            print(f"{'':<8} | {'Pearson':<10} | {stats_row['Pear_Rate_1']:.4f}       | {stats_row['Pear_Pval_1']:.4f}     | {stats_row['Pear_Rate_5']:.4f}       | {stats_row['Pear_Pval_5']:.4f}")
+
+        except Exception as e:
+            print(f"Error on {t}: {e}")
+
+    # ===============================================================
+    # SAVE & AGGREGATE
+    # ===============================================================
+    res_df = pd.DataFrame(results)
+    res_df.to_csv(OUT_PATH, index=False)
+    
+    print("\n" + "="*50)
+    print("AGGREGATE RESULTS")
+    print("="*50)
+    
+    # Calculate Mean Absolute Deviation from Target (Ideal = 0)
+    res_df["Stud_Err_1"] = abs(res_df["Stud_Rate_1"] - 0.01)
+    res_df["Pear_Err_1"] = abs(res_df["Pear_Rate_1"] - 0.01)
+    res_df["Stud_Err_5"] = abs(res_df["Stud_Rate_5"] - 0.05)
+    res_df["Pear_Err_5"] = abs(res_df["Pear_Rate_5"] - 0.05)
+    
+    print(f"Average Deviation from 1% VaR:")
+    print(f"  Student-t (MLE): {res_df['Stud_Err_1'].mean():.5f}")
+    print(f"  Pearson VII (LM): {res_df['Pear_Err_1'].mean():.5f}")
+    
+    print(f"\nAverage Deviation from 5% VaR:")
+    print(f"  Student-t (MLE): {res_df['Stud_Err_5'].mean():.5f}")
+    print(f"  Pearson VII (LM): {res_df['Pear_Err_5'].mean():.5f}")
+    
+    print(f"\n💾 Full results saved to: {OUT_PATH}")
+
+if __name__ == "__main__":
+    main()
