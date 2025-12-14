@@ -1,0 +1,98 @@
+import os
+import numpy as np
+import pandas as pd
+import warnings
+from arch import arch_model
+warnings.filterwarnings("ignore")
+
+# -------- Paths --------
+BASE_DIR  = r"C:\Kurtay Finance Project\Data"
+IN_PATH   = os.path.join(BASE_DIR, "CLEANWRDS.csv")
+OUT_PARAM = os.path.join(BASE_DIR, "New_EGARCH_Student.csv")
+OUT_RESID = os.path.join(BASE_DIR, "Student_Residuals")
+os.makedirs(OUT_RESID, exist_ok=True)
+
+# -------- Tickers --------
+tech = ["AAPL","MSFT","INTC","CSCO","IBM","AMZN",
+        "NVDA","XRX","ADBE","QCOM","HPQ","ADP"]
+ind  = ["RTX","ETN","DE","HON","UPS","FDX",
+        "UNP","BA","NOC","ROK","EMR","CAT"]
+tickers = tech + ind
+
+# -------- Helper: preprocess returns --------
+def preprocess_series(s, min_len=250):
+    x = pd.to_numeric(s, errors="coerce").dropna()
+    if len(x) < min_len:
+        return pd.Series(dtype=float)
+    lo, hi = x.quantile(0.01), x.quantile(0.99)
+    x = x.clip(lo, hi)
+    return x
+
+# -------- Fit EGARCH(1,3)-t and save residuals --------
+df = pd.read_csv(IN_PATH)
+results, failed = [], []
+
+print("\n🚀 Running EGARCH(1,3) with Student-t errors and exporting residuals...\n")
+
+for t in tickers:
+    print(f"================ {t} ================")
+    x = preprocess_series(df.loc[df["ticker"] == t, "log_ret"])
+    if x.empty:
+        print(f"⚠️ {t}: not enough data.")
+        failed.append((t, "no data"))
+        continue
+    try:
+        # Initialize with Normal EGARCH for stable starting values
+        amN = arch_model(x, vol="EGARCH", p=1, q=3, mean="Constant",
+                         dist="normal", rescale=True)
+        resN = amN.fit(disp="off", tol=1e-5)
+        start_vals = resN.params.copy()
+        start_vals["nu"] = 8.0  # initial df
+
+        # Fit Student-t EGARCH(1,3)
+        am = arch_model(x, vol="EGARCH", p=1, q=3, mean="Constant",
+                        dist="t", rescale=True)
+        res = am.fit(starting_values=start_vals, disp="off",
+                     tol=1e-6, options={"maxiter":5000})
+
+        # --- Save standardized residuals ---
+        resid_path = os.path.join(OUT_RESID, f"{t}_resid.csv")
+        pd.Series(res.std_resid, name="std_resid").to_csv(resid_path, index=False)
+
+        # --- Record parameters ---
+        alpha = res.params.get("alpha[1]", np.nan)
+        betas = [res.params.get(f"beta[{i}]", 0) for i in range(1,4)]
+        persistence = alpha + sum(betas)
+        nu = res.params.get("nu", np.nan)
+
+        results.append({
+            "ticker": t,
+            "mu": res.params.get("mu", np.nan),
+            "omega": res.params.get("omega", np.nan),
+            "alpha[1]": alpha,
+            "beta[1]": betas[0],
+            "beta[2]": betas[1],
+            "beta[3]": betas[2],
+            "persistence": persistence,
+            "nu": nu,
+            "logL": res.loglikelihood,
+            "AIC": res.aic,
+            "BIC": res.bic,
+            "convergence_flag": getattr(res, "convergence_flag", 0)
+        })
+        print(f"✅ {t}: α+βs={persistence:.3f}, ν={nu:.2f}, resid→{resid_path}")
+
+    except Exception as e:
+        print(f"❌ {t}: EGARCH Student-t failed — {e}")
+        failed.append((t,str(e)))
+
+# -------- Save parameter table --------
+pd.DataFrame(results).to_csv(OUT_PARAM, index=False)
+print(f"\n💾 Saved EGARCH(1,3) Student-t parameters to:\n{OUT_PARAM}")
+print(f"✅ Successful fits: {len(results)} | ❌ Failures: {len(failed)}")
+
+# Quick degrees-of-freedom summary
+if results:
+    dfres = pd.DataFrame(results)
+    print("\nν summary (degrees of freedom):")
+    print(dfres['nu'].describe())
