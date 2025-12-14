@@ -1,0 +1,120 @@
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+import lmoments3 as lm
+import wrds
+
+# --- Configuration ---
+warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
+BASE_DIR = r"C:\Kurtay Finance Project\Data"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# --- WRDS Connection ---
+db = wrds.Connection()
+
+# --- Define tickers (12 Tech + 12 Industrial) ---
+tech = ["AAPL","MSFT","INTC","CSCO","IBM","AMZN",
+        "NVDA","XRX","ADBE","QCOM","HPQ","ADP"]
+ind  = ["RTX","ETN","DE","HON","UPS","FDX",
+        "UNP","BA","NOC","ROK","EMR","CAT"]
+tickers = tech + ind
+
+# --- SQL Query ---
+sql = f"""
+SELECT d.permno,
+       n.ticker,
+       d.date,
+       d.ret,
+       d.retx,
+       dl.dlret
+FROM crsp.dsf AS d
+JOIN crsp.stocknames AS n
+  ON d.permno = n.permno
+ AND n.namedt <= d.date
+ AND d.date < n.nameenddt
+LEFT JOIN crsp.dse AS dl
+  ON d.permno = dl.permno
+ AND d.date = dl.date
+WHERE n.ticker IN ({','.join(["'" + t + "'" for t in tickers])})
+  AND n.shrcd IN (10,11)
+  AND n.exchcd IN (1,2,3)
+  AND d.date BETWEEN '2000-01-01' AND '2024-12-31'
+ORDER BY n.ticker, d.date;
+"""
+print("📡 Querying WRDS ...")
+df = db.raw_sql(sql)
+
+# --- Cleaning ---
+df["date"] = pd.to_datetime(df["date"])
+df = df.drop_duplicates(subset=["permno","date"])
+df = df.sort_values(["ticker","date"])
+
+# --- Compute effective return (RET + DLRET) ---
+df["ret"] = pd.to_numeric(df["ret"], errors="coerce")
+df["dlret"] = pd.to_numeric(df["dlret"], errors="coerce")
+df["ret_eff"] = df["ret"]
+mask = df["dlret"].notna()
+df.loc[mask, "ret_eff"] = (1 + df.loc[mask, "ret_eff"]) * (1 + df.loc[mask, "dlret"]) - 1
+
+# --- Compute log returns ---
+df["log_ret"] = np.log1p(df["ret_eff"])
+df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["log_ret"])
+df = df.dropna(subset=["ticker"]).drop_duplicates(subset=["ticker","date"], keep="last")
+
+# --- Assign sectors ---
+df["sector"] = np.where(df["ticker"].isin(tech), "Tech", "Industrial")
+
+# --- Winsorize per ticker (0.5–99.5%) ---
+def winsorize(group):
+    low, high = group["log_ret"].quantile([0.005, 0.995])
+    group["log_ret"] = group["log_ret"].clip(lower=low, upper=high)
+    return group
+
+df = df.groupby("ticker", group_keys=False).apply(winsorize)
+
+# --- Descriptive Stats ---
+summary = df.groupby("ticker")["log_ret"].agg([
+    ("mean", "mean"),
+    ("std", "std"),
+    ("skew", stats.skew),
+    ("kurt", lambda x: stats.kurtosis(x, fisher=True))
+])
+
+# --- L-Moments per ticker ---
+def lmoment_summary(x):
+    x = x.dropna()
+    if len(x) < 10:
+        return pd.Series({"L1": np.nan, "L2": np.nan, "L3/L2": np.nan, "L4/L2": np.nan})
+    try:
+        l = lm.lmom_ratios(x)
+        return pd.Series({"L1": l[0], "L2": l[1], "L3/L2": l[2], "L4/L2": l[3]})
+    except Exception:
+        return pd.Series({"L1": np.nan, "L2": np.nan, "L3/L2": np.nan, "L4/L2": np.nan})
+
+lm_summary = df.groupby("ticker")["log_ret"].apply(lmoment_summary)
+stats_summary = summary.join(lm_summary)
+stats_summary["sector"] = stats_summary.index.map(lambda t: "Tech" if t in tech else "Industrial")
+
+# --- Coverage check ---
+coverage = (
+    df.groupby("ticker")["date"]
+      .agg(first_date="min", last_date="max", n_obs="count")
+      .sort_values("first_date")
+)
+
+# --- Save outputs ---
+clean_path = os.path.join(BASE_DIR, "CLEANWRDS.csv")
+summary_path = os.path.join(BASE_DIR, "Descriptive_LMoments.csv")
+df.to_csv(clean_path, index=False)
+stats_summary.to_csv(summary_path)
+coverage.to_csv(os.path.join(BASE_DIR, "Coverage.csv"))
+
+print("\n✅ Files saved:")
+print("•", clean_path)
+print("•", summary_path)
+print("•", os.path.join(BASE_DIR, "Coverage.csv"))
+
+print("\n📊 Coverage summary:")
+print(coverage)

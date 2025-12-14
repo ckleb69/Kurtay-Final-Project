@@ -1,0 +1,86 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import io
+
+# 1. Your Data
+csv_data = """ticker,n,Best_Model,AIC_Normal,AIC_StudentT,AIC_PearsonVII,m_lmom
+AAPL,6287,PearsonVII,17851.55,17719.85,17582.20,3.87
+ADBE,6287,PearsonVII,17880.27,17616.38,17355.48,3.23
+ADP,6244,PearsonVII,17694.17,17524.83,17323.23,3.36
+AMZN,6288,PearsonVII,17932.83,17637.24,17382.64,3.29
+BA,6288,PearsonVII,17838.12,17754.19,17653.62,4.39
+CAT,6287,PearsonVII,17800.24,17719.47,17598.13,3.90
+CSCO,6287,PearsonVII,17993.91,17626.23,17347.54,3.26
+DE,6288,PearsonVII,17831.54,17701.04,17546.23,3.70
+EMR,6284,PearsonVII,17794.17,17723.51,17617.86,3.94
+ETN,3247,PearsonVII,9209.33,9186.35,9155.61,4.84
+FDX,6287,PearsonVII,17822.43,17718.00,17582.89,3.93
+HON,6285,PearsonVII,17823.37,17730.63,17619.57,4.04
+HPQ,5703,PearsonVII,16119.77,15982.35,15780.94,3.25
+IBM,6286,PearsonVII,17888.37,17632.42,17383.56,3.35
+INTC,6288,PearsonVII,17908.03,17739.91,17602.65,4.25
+MSFT,6288,PearsonVII,17857.89,17696.30,17532.82,3.62
+NOC,6287,PearsonVII,17768.26,17669.33,17506.92,3.51
+NVDA,6288,PearsonVII,17853.66,17718.73,17574.58,3.94
+QCOM,6287,PearsonVII,17921.66,17631.45,17373.40,3.28
+ROK,6284,PearsonVII,17827.20,17688.38,17530.07,3.71
+RTX,1949,PearsonVII,5582.74,5436.99,5338.45,2.78
+UNP,6288,PearsonVII,17826.42,17728.94,17602.21,4.06
+UPS,6285,PearsonVII,17784.59,17635.93,17432.52,3.35
+XRX,6280,PearsonVII,17830.39,17639.27,17434.44,3.48"""
+
+# 2. Process Data
+df = pd.read_csv(io.StringIO(csv_data))
+df = df[['ticker', 'n', 'AIC_Normal', 'AIC_StudentT', 'AIC_PearsonVII', 'm_lmom']]
+df.columns = ['Ticker', 'N', 'Normal (AIC)', 'Student-t (AIC)', 'Pearson VII (AIC)', 'Shape (m)']
+
+# Calculate Average
+avg_row = pd.DataFrame(df.mean(numeric_only=True)).T
+avg_row['Ticker'] = 'Average'
+avg_row['N'] = '-'
+df = pd.concat([df, avg_row], ignore_index=True)
+
+# Formatting numbers
+cols_aic = ['Normal (AIC)', 'Student-t (AIC)', 'Pearson VII (AIC)']
+for col in cols_aic:
+    df[col] = df[col].apply(lambda x: "{:,.1f}".format(x))
+df['Shape (m)'] = df['Shape (m)'].apply(lambda x: "{:.2f}".format(x))
+
+# 3. Create Plot
+fig, ax = plt.subplots(figsize=(10, 8)) # Adjust size as needed
+ax.axis('tight')
+ax.axis('off')
+
+# Main Table
+table_data = [df.columns.values] + df.values.tolist()
+table = ax.table(cellText=table_data, colLabels=None, cellLoc='center', loc='center')
+
+# 4. Styling (The "Professional" Look)
+table.auto_set_font_size(False)
+table.set_fontsize(10)
+table.scale(1.2, 1.3) # Adjust row height/column width
+
+# Headers: Bold and Gray Background
+for j, col in enumerate(df.columns):
+    cell = table[0, j]
+    cell.set_text_props(weight='bold', color='black')
+    cell.set_facecolor('#e6e6e6') # Light Gray header
+
+# Alternating Row Colors (Zebra Striping)
+for i in range(1, len(df)+1):
+    for j in range(len(df.columns)):
+        cell = table[i, j]
+        if i == len(df): # The "Average" Row
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#f2f2f2')
+        elif i % 2 == 0:
+            cell.set_facecolor('#f9f9f9') # Very light gray for even rows
+
+# Bold the "Pearson VII (AIC)" column to highlight the winner
+pearson_col_idx = 4
+for i in range(1, len(df)+1):
+    table[i, pearson_col_idx].set_text_props(weight='bold')
+
+plt.title("Table 1: Model Selection Criteria (AIC) by Asset", fontsize=12, weight='bold', y=0.98)
+plt.savefig("Table1_Final.png", dpi=300, bbox_inches='tight')
+plt.show()

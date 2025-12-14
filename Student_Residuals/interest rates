@@ -1,0 +1,231 @@
+import os
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from arch import arch_model
+from scipy.special import gamma
+from scipy.optimize import minimize
+from scipy.stats import t as student_t_dist
+from scipy.integrate import quad
+import lmoments3 as lm
+import warnings
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIGURATION & PATHS
+# ============================================================
+BASE = r"C:\Kurtay Finance Project\Data"
+IN_RET = os.path.join(BASE, "CLEANWRDS.csv")            # Columns: date, ticker, log_ret
+IN_RATE = os.path.join(BASE, "FRED_DGS3MO.csv")         # Columns: date, rf_rate
+OUT_BOOT = os.path.join(BASE, "RateRegime_Boot_Lmoment.csv")
+OUT_SUMM = os.path.join(BASE, "RateRegime_Summary_Lmoment.csv")
+
+# Simulation Settings
+BLOCK_LEN = 30          # Block bootstrap size (days)
+N_BOOT = 5              # Replications per regime (Keep low for testing, increase to 100+ for final)
+MIN_REGIME_LEN = 250    # Minimum days to qualify as a regime
+RET_SCALE = 100.0       # Scale returns for EGARCH stability
+
+# ============================================================
+# MATHEMATICAL FUNCTIONS (L-MOMENTS & LIKELIHOODS)
+# ============================================================
+
+def ll_normal(z):
+    return -0.5 * np.sum(z**2 + np.log(2 * np.pi))
+
+def ll_student_t(z, nu):
+    if nu <= 2: return -1e10
+    c = gamma((nu + 1) / 2) / (np.sqrt(nu * np.pi) * gamma(nu / 2))
+    return np.sum(np.log(c) - ((nu + 1) / 2) * np.log(1 + z**2 / nu))
+
+def ll_pearson7(z, m, scale):
+    if m <= 0.5 or scale <= 0: return -1e10
+    c = gamma(m) / (scale * np.sqrt(np.pi) * gamma(m - 0.5))
+    return np.sum(np.log(c) - m * np.log(1 + (z / scale)**2))
+
+def get_theoretical_lmoms(m, scale):
+    """Calculate Theoretical L2 and Tau4 for Pearson VII via Student-t equivalence."""
+    if m <= 1.01 or scale <= 0: return np.inf, np.inf
+    nu = 2 * m - 1
+    factor = scale / np.sqrt(nu)
+    
+    # L2 Integration
+    # Integral of Q(F) * (2F - 1)
+    l2_raw, _ = quad(lambda f: student_t_dist.ppf(f, df=nu) * (2*f - 1), 0, 1)
+    theo_l2 = l2_raw * factor
+    
+    # L4 Integration
+    # Integral of Q(F) * (20F^3 - 30F^2 + 12F - 1)
+    l4_raw, _ = quad(lambda f: student_t_dist.ppf(f, df=nu) * (20*f**3 - 30*f**2 + 12*f - 1), 0, 1)
+    theo_l4 = l4_raw * factor
+    
+    # Tau4
+    if theo_l2 == 0: return np.inf, np.inf
+    theo_tau4 = theo_l4 / theo_l2
+    
+    return theo_l2, theo_tau4
+
+# ============================================================
+# OPTIMIZERS
+# ============================================================
+
+def fit_student_t_mle(z):
+    """Fit Student-t via MLE (Minimizing Negative Log-Likelihood)"""
+    def nll(nu): 
+        return -ll_student_t(z, nu[0])
+    
+    res = minimize(nll, [8.0], bounds=[(2.01, 200.0)], method="L-BFGS-B")
+    return res.x[0], -res.fun if res.success else -np.inf
+
+def fit_pearson7_lmom(z):
+    """Fit Pearson VII via Method of L-Moments (Minimizing Squared Error)"""
+    try:
+        # 1. Calc Sample Moments
+        lm_vals = lm.lmom_ratios(z.tolist(), nmom=4)
+        samp_l2, samp_t4 = lm_vals[1], lm_vals[3]
+        
+        # 2. Optimize Params to match Sample Moments
+        def obj(p):
+            if p[0] <= 1.01 or p[1] <= 1e-6: return 1e9
+            tl2, tt4 = get_theoretical_lmoms(p[0], p[1])
+            # Weighted error (giving Tau4 implies focusing on tails)
+            return (tl2 - samp_l2)**2 + (tt4 - samp_t4)**2
+
+        res = minimize(obj, [4.0, 1.0], bounds=[(1.02, 50.0), (0.01, 10.0)], method="L-BFGS-B")
+        
+        # Calculate RMSE of the fit (How close did we get to the moments?)
+        final_rmse = np.sqrt(res.fun)
+        return res.x[0], res.x[1], final_rmse, samp_l2, samp_t4
+    except:
+        return np.nan, np.nan, np.inf, np.nan, np.nan
+
+# ============================================================
+# DATA PREP
+# ============================================================
+print("📥 Loading Data...")
+
+# Load Returns
+ret = pd.read_csv(IN_RET)
+ret.columns = ret.columns.str.lower()
+ret = ret.rename(columns={"ticker": "ticker", "date": "date", "log_ret": "log_ret"})
+ret["date"] = pd.to_datetime(ret["date"])
+ret["ticker"] = ret["ticker"].str.upper().str.strip()
+
+# Load Rates
+rate = pd.read_csv(IN_RATE)
+rate.columns = map(str.lower, rate.columns)
+# Auto-detect rate column
+rate_col = [c for c in rate.columns if "date" not in c][0]
+rate = rate.rename(columns={rate_col: "rf_rate", "date": "date"})
+rate["date"] = pd.to_datetime(rate["date"])
+
+# Merge
+df = ret.merge(rate, on="date", how="inner").dropna(subset=["log_ret", "rf_rate"])
+df = df.sort_values(["ticker", "date"])
+
+# Create Regimes
+df["rate_regime"] = pd.qcut(df["rf_rate"], 3, labels=["Low", "Medium", "High"])
+tickers = df["ticker"].unique()
+
+print(f"✅ Data Ready: {len(df)} rows, {len(tickers)} tickers.")
+
+# ============================================================
+# MAIN BOOTSTRAP LOOP
+# ============================================================
+results = []
+rng = np.random.default_rng(123)
+
+print("\n🚀 Starting Regime Bootstrap...")
+
+for tkr in tickers:
+    dtk = df[df["ticker"] == tkr].copy()
+    dtk["ret_scaled"] = pd.to_numeric(dtk["log_ret"], errors='coerce') * RET_SCALE
+    dtk = dtk.dropna()
+
+    for regime in ["Low", "Medium", "High"]:
+        subset = dtk[dtk["rate_regime"] == regime]["ret_scaled"].values
+        if len(subset) < MIN_REGIME_LEN: continue
+        
+        # Run N_BOOT replications
+        for i in range(N_BOOT):
+            try:
+                # 1. Block Bootstrap Resampling
+                idxs = []
+                while len(idxs) < len(subset):
+                    start = rng.integers(0, len(subset) - BLOCK_LEN)
+                    idxs.extend(range(start, start + BLOCK_LEN))
+                boot_x = subset[idxs[:len(subset)]]
+
+                # 2. Fit EGARCH Filter to get Residuals
+                am = arch_model(boot_x, vol="EGARCH", p=1, q=3, dist="t", rescale=False)
+
+# FIX 1: Increase iterations to 500 (gives hard-to-fit samples more time)
+# FIX 2: Suppress the warning printout so it doesn't clutter your screen
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                res = am.fit(disp="off", options={"maxiter": 500})
+
+# FIX 3: Check if it actually converged. If not, skip this loop.
+                if res.convergence_flag != 0:
+                    continue  # Skip this bad sample
+
+                z = res.std_resid
+
+                # 3. Fit Normal (AIC)
+                ll_n = ll_normal(z)
+                aic_n = 2*0 - 2*ll_n
+
+                # 4. Fit Student-t (MLE -> Best Likelihood)
+                nu_t, ll_t = fit_student_t_mle(z)
+                aic_t = 2*1 - 2*ll_t
+                
+                # Calculate L-moment error for Student-t (Fair Comparison)
+                lm_z = lm.lmom_ratios(z.tolist(), nmom=4)
+                l2_z, t4_z = lm_z[1], lm_z[3]
+                t_l2_theo, t_t4_theo = get_theoretical_lmoms((nu_t+1)/2, 1.0) # approx mapping
+                rmse_t = np.sqrt((t_l2_theo - l2_z)**2 + (t_t4_theo - t4_z)**2)
+
+                # 5. Fit Pearson VII (L-Mom -> Best Tail Shape)
+                m_p, s_p, rmse_p, _, _ = fit_pearson7_lmom(z)
+                ll_p = ll_pearson7(z, m_p, s_p)
+                aic_p = 2*2 - 2*ll_p
+
+                # 6. Determine Winners
+                # Metric A: AIC (Likelihood)
+                best_aic = min({"Normal": aic_n, "StudentT": aic_t, "PearsonVII": aic_p}, 
+                               key=lambda k: {"Normal": aic_n, "StudentT": aic_t, "PearsonVII": aic_p}[k])
+                
+                # Metric B: Moment Error (RMSE) - Who fits the shape better?
+                # (Normal doesn't target moments, so we compare T vs P)
+                best_rmse = "PearsonVII" if rmse_p < rmse_t else "StudentT"
+
+                results.append({
+                    "ticker": tkr,
+                    "regime": regime,
+                    "boot_id": i,
+                    "AIC_Normal": aic_n, "AIC_Student": aic_t, "AIC_Pearson": aic_p,
+                    "RMSE_Student": rmse_t, "RMSE_Pearson": rmse_p,
+                    "Win_AIC": best_aic,
+                    "Win_RMSE": best_rmse
+                })
+
+            except Exception as e:
+                continue
+    
+    print(f"✅ Processed {tkr}")
+
+# ============================================================
+# SAVE & SUMMARIZE
+# ============================================================
+res_df = pd.DataFrame(results)
+res_df.to_csv(OUT_BOOT, index=False)
+
+# Summary Pivot
+summary = res_df.groupby("regime")[["Win_AIC", "Win_RMSE"]].apply(lambda x: x.value_counts(normalize=True)).unstack()
+summary.to_csv(OUT_SUMM)
+
+print("\n📊 Summary of Win Rates (By Regime):")
+print(summary)
+print(f"\n💾 Results saved to {OUT_BOOT}")

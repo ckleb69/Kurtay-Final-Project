@@ -1,0 +1,68 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# ==========================================
+# 1. INPUT YOUR BOOTSTRAP RESULTS HERE
+# ==========================================
+# Update these values with your actual findings
+data = {
+    'Regime': [
+        'Low Interest Rate ', 
+        'Medium Interest Rate', 
+        'High Interest Rate ',
+        'Full Sample'
+    ],
+    'N_Samples': [500, 500, 500, 1500],
+    'Pearson_Win_RMSE': ['92.4%', '94.6%', '89.8%', '92.3%'],  # % of times Pearson had lower RMSE
+    'Pearson_Win_AIC': ['68.2%', '71.5%', '74.8%', '71.5%'],   # % of times Pearson had lower AIC
+    'Dominant_Model': ['Pearson VII', 'Pearson VII', 'Pearson VII', 'Pearson VII']
+}
+
+# ==========================================
+# 2. CREATE DATAFRAME
+# ==========================================
+df = pd.DataFrame(data)
+df.columns = ['Economic Regime', 'Bootstrap Samples', 'Win Rate (RMSE)', 'Win Rate (AIC)', 'Conclusion']
+
+# ==========================================
+# 3. GENERATE TABLE IMAGE
+# ==========================================
+fig, ax = plt.subplots(figsize=(10, 4)) # Adjusted height since table is shorter
+ax.axis('tight')
+ax.axis('off')
+
+# Create the table
+table_data = [df.columns.values] + df.values.tolist()
+table = ax.table(cellText=table_data, colLabels=None, cellLoc='center', loc='center')
+
+# ==========================================
+# 4. STYLING
+# ==========================================
+table.auto_set_font_size(False)
+table.set_fontsize(10)
+table.scale(1.2, 1.8) # Increase row height for readability
+
+# Style the Headers
+for j, col in enumerate(df.columns):
+    cell = table[0, j]
+    cell.set_text_props(weight='bold', color='black')
+    cell.set_facecolor('#e6e6e6') # Light Gray header
+
+# Style the Rows
+for i in range(1, len(df)+1):
+    for j in range(len(df.columns)):
+        cell = table[i, j]
+        
+        # Zebra Striping (Alternating Colors)
+        if i % 2 == 0:
+            cell.set_facecolor('#f9f9f9')
+            
+        # Bold the "Aggregate" row at the bottom
+        if i == len(df):
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#f2f2f2')
+
+# Save and Show
+plt.title("Table 3: Bootstrap Win Rates by Regime", fontsize=12, weight='bold', y=1.05)
+plt.savefig("Table3_Bootstrap_Results.png", dpi=300, bbox_inches='tight')
+plt.show()

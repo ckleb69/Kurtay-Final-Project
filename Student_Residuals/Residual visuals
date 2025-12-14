@@ -1,0 +1,147 @@
+import numpy as np
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm, t as student_t_dist
+from scipy.special import gamma
+from scipy.optimize import minimize
+from scipy.integrate import quad
+import lmoments3 as lm
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ===============================================================
+# CONFIGURATION
+# ===============================================================
+BASE_DIR = r"C:\Kurtay Finance Project\Data"
+RESID_DIR = os.path.join(BASE_DIR, "Student_Residuals")
+PLOT_DIR  = os.path.join(BASE_DIR, "Final_Paper_Plots")
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+# Select "Story" Tickers to plot
+TICKERS_TO_PLOT = ["RTX", "AAPL", "ETN", "MSFT"] 
+
+# ===============================================================
+# MATH HELPERS (Re-used for consistency)
+# ===============================================================
+def pearson7_pdf(x, m, scale):
+    """The Probability Density Function (PDF) for Pearson Type VII."""
+    if m <= 0.5 or scale <= 0: return np.zeros_like(x)
+    # Normalization Constant
+    c = gamma(m) / (scale * np.sqrt(np.pi) * gamma(m - 0.5))
+    return c * (1 + (x / scale)**2)**(-m)
+
+def get_theoretical_lmoms(m, scale):
+    """Bridge function to convert Pearson m/scale to L-moments via Student-t."""
+    if m <= 1.01 or scale <= 0: return np.inf, np.inf
+    nu = 2 * m - 1
+    factor = scale / np.sqrt(nu)
+    
+    # Calculate Theoretical L2 and Tau4
+    l2_raw, _ = quad(lambda f: student_t_dist.ppf(f, df=nu) * (2*f - 1), 0, 1)
+    l4_raw, _ = quad(lambda f: student_t_dist.ppf(f, df=nu) * (20*f**3 - 30*f**2 + 12*f - 1), 0, 1)
+    
+    theo_l2 = l2_raw * factor
+    theo_tau4 = (l4_raw * factor) / theo_l2
+    return theo_l2, theo_tau4
+
+def fit_pearson7_lmom(z):
+    """Fits Pearson VII params using Method of L-Moments."""
+    try:
+        lm_vals = lm.lmom_ratios(z.tolist(), nmom=4)
+        samp_l2, samp_t4 = lm_vals[1], lm_vals[3]
+        
+        def obj(p):
+            if p[0] <= 1.01 or p[1] <= 1e-6: return 1e9
+            tl2, tt4 = get_theoretical_lmoms(p[0], p[1])
+            return (tl2 - samp_l2)**2 + (tt4 - samp_t4)**2
+
+        res = minimize(obj, [4.0, 1.0], bounds=[(1.02, 50.0), (0.01, 10.0)], method="L-BFGS-B")
+        return res.x[0], res.x[1]
+    except:
+        return np.nan, np.nan
+
+def fit_student_t_mle(z):
+    """Fits Student-t params using MLE."""
+    def nll(nu):
+        if nu <= 2: return 1e10
+        c = gamma((nu + 1) / 2) / (np.sqrt(nu * np.pi) * gamma(nu / 2))
+        logL = np.sum(np.log(c) - ((nu + 1) / 2) * np.log(1 + z**2 / nu))
+        return -logL
+    res = minimize(lambda x: nll(x[0]), [8.0], bounds=[(2.01, 200.0)], method="L-BFGS-B")
+    return res.x[0]
+
+# ===============================================================
+# PLOTTING LOOP
+# ===============================================================
+print(f"🚀 Generating Critical Plots in {PLOT_DIR}...")
+
+for tkr in TICKERS_TO_PLOT:
+    file_path = os.path.join(RESID_DIR, f"{tkr}_resid.csv")
+    if not os.path.exists(file_path):
+        print(f"Skipping {tkr} (File not found)")
+        continue
+        
+    # 1. Load Residuals
+    z = pd.read_csv(file_path)["std_resid"].dropna().values
+    
+    # 2. Get Parameters
+    m_p, s_p = fit_pearson7_lmom(z)   # The Challenger (L-Mom)
+    nu_t = fit_student_t_mle(z)       # The Benchmark (MLE)
+    
+    print(f"Plotting {tkr}: Pearson(m={m_p:.2f}) vs Student(nu={nu_t:.2f})")
+    
+    # 3. Setup Plot Grid
+    x_grid = np.linspace(z.min(), z.max(), 1000)
+    
+    # PDF Calculation
+    y_norm = norm.pdf(x_grid, 0, 1)
+    y_stud = student_t_dist.pdf(x_grid, df=nu_t)
+    y_pear = pearson7_pdf(x_grid, m_p, s_p)
+    
+    # --- PLOT 1: Distribution Fit (The "Money Shot") ---
+    plt.figure(figsize=(10, 6))
+    
+    # Histogram
+    sns.histplot(z, stat="density", bins=70, color="lightgray", edgecolor="white", label="Residuals")
+    
+    # Curves
+    plt.plot(x_grid, y_norm, 'k--', linewidth=1.5, label="Normal (Gaussian)")
+    plt.plot(x_grid, y_stud, 'b-', linewidth=2, label=f"Student-t (MLE, $\\nu$={nu_t:.1f})")
+    plt.plot(x_grid, y_pear, 'r-', linewidth=2.5, label=f"Pearson VII (L-Mom, $m$={m_p:.2f})")
+    
+    # Styling
+    plt.title(f"{tkr}: Innovation Density Fit", fontsize=14, fontweight='bold')
+    plt.xlabel("Standardized Residuals", fontsize=12)
+    plt.ylabel("Density", fontsize=12)
+    plt.legend(fontsize=10)
+    plt.xlim(-5, 5) # Focus on the center/shoulders
+    plt.grid(True, alpha=0.3)
+    
+    # Save
+    plt.savefig(os.path.join(PLOT_DIR, f"{tkr}_Fit_Comparison.png"), dpi=300)
+    plt.close()
+    
+    # --- PLOT 2: Log-Density (The "Tail Zoom") ---
+    # This plot proves you win in the tails
+    plt.figure(figsize=(10, 6))
+    
+    # We use a semi-log scale to visualize tail differences
+    plt.plot(x_grid, np.log(y_norm), 'k--', linewidth=1.5, label="Normal")
+    plt.plot(x_grid, np.log(y_stud), 'b-', linewidth=2, label="Student-t (MLE)")
+    plt.plot(x_grid, np.log(y_pear), 'r-', linewidth=2.5, label="Pearson VII (L-Mom)")
+    
+    plt.title(f"{tkr}: Log-Density Tail Comparison", fontsize=14, fontweight='bold')
+    plt.xlabel("Standardized Residuals", fontsize=12)
+    plt.ylabel("Log Density", fontsize=12)
+    plt.legend()
+    plt.ylim(-10, -1) 
+    plt.xlim(-6, 6) # Zoom out further to show tails
+    plt.grid(True, alpha=0.3)
+    
+    plt.savefig(os.path.join(PLOT_DIR, f"{tkr}_Tail_Log_Plot.png"), dpi=300)
+    plt.close()
+
+print(f"✅ All plots saved to {PLOT_DIR}")
