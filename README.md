@@ -1,5 +1,5 @@
 # Kurtay-Final-Project
-This project introduces a robust risk forecasting framework that improves upon conventional volatility models. By integrating an **EGARCH(1,3)** volatility filter with **Pearson Type VII innovations** estimated via **L-moments**, this model addresses the heavy tails and volatility asymmetry often observed in financial markets.
+This project introduces a robust risk forecasting framework that improves upon conventional volatility models. By integrating an EGARCH(1,3) volatility filter with Pearson Type VII innovations estimated via L-moments, this model addresses the heavy tails and volatility asymmetry often observed in financial markets.
 
 The study analyzes 25 years of daily returns (2000–2024) for 24 major US equities, demonstrating that the proposed framework consistently outperforms standard Normal and Student-t benchmarks in Value-at-Risk (VaR) coverage and goodness-of-fit tests.
 
